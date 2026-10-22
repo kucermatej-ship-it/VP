@@ -13,7 +13,7 @@ Vysledny seznam pacientu lze pak dale zuzit textovym hledanim v dekurzech/anamne
 import datetime
 
 from db import get_connection, seznam_databazi
-import dotaz
+import schema_pravidla
 import text_search
 
 
@@ -154,12 +154,20 @@ def sestav_sql(filtry):
     return sql, params
 
 
+def _over_sql(sql):
+    """Pojistka i pro nase rucne sestavene SQL: jen jeden SELECT a jen povolene tabulky/sloupce
+    (schema_pravidla.py) - kdyby v tomto souboru pribyla chyba, projevi se hned, ne az na databazi."""
+    if not sql.lstrip().upper().startswith("SELECT") or ";" in sql:
+        raise ValueError(f"Povoleny je jen jeden SELECT dotaz: {sql}")
+    schema_pravidla.zkontroluj_sql(sql)
+
+
 def _spust_ve_vsech_databazich(sql, params=None, on_progress=None):
     """
-    Overi SQL (schema_pravidla.py - pojistka i pro nase rucne sestavene SQL) a spusti ho
-    postupne ve vsech databazich ve slozce data/. Vraci dict {nazev_databaze: radky}.
+    Overi SQL (viz _over_sql) a spusti ho postupne ve vsech databazich ve slozce data/.
+    Vraci dict {nazev_databaze: radky}.
     """
-    dotaz.over_sql(sql)
+    _over_sql(sql)
     databaze = seznam_databazi()
     vysledek = {}
     for i, o in enumerate(databaze):
@@ -167,7 +175,9 @@ def _spust_ve_vsech_databazich(sql, params=None, on_progress=None):
             on_progress(i / len(databaze), f"Filtruji: databaze {o['nazev']} ({i + 1}/{len(databaze)})")
         con = get_connection(o["cesta"])
         try:
-            _, vysledek[o["nazev"]] = dotaz.spust_sql_s_pripojenim(sql, con, params=params)
+            cur = con.cursor()
+            cur.execute(sql, params or [])
+            vysledek[o["nazev"]] = cur.fetchall()
         finally:
             con.close()
     if on_progress:
