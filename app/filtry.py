@@ -13,6 +13,7 @@ Vysledny seznam pacientu lze pak dale zuzit textovym hledanim v dekurzech/anamne
 import datetime
 
 from db import get_connection, seznam_databazi
+import ordinace as ordinace_modul
 import schema_pravidla
 import text_search
 
@@ -57,13 +58,13 @@ def sestav_sql(filtry):
     se kombinuji pres AND). Podporovane klice:
         vek_od, vek_do (int)
         pohlavi ("M" nebo "F")
-        ordinace (seznam str - presne nazvy ordinaci, viz nacti_ordinace())
         bmi_od, bmi_do / vaha_od, vaha_do / vyska_od, vyska_do (float)
         tlaksys_od, tlaksys_do / tlakdia_od, tlakdia_do / puls_od, puls_do (int)
         datum_od, datum_do (datetime.date) - jedno spolecne obdobi pro VSECHNY filtry s datem:
               - telesne hodnoty: mereni (M_PRISTAV.DATUM) v tomto obdobi
               - medikace: predepsano (M_MEDIREC.DATUM) v tomto obdobi
               - vykony: proveden (P_DOKLADPOL.DATUM) v tomto obdobi
+              - (ordinace se filtruje az ve filtruj_pacienty() - posledni dekurz v obdobi)
               - diagnoza: VYJIMKA - trvala diagnoza plati "od DATOD dale", posuzuje se jen,
                 jestli byla zapsana nejpozdeji do konce obdobi (datum_od se NEPOUZIVA)
         diagnoza (str - hodnoty oddelene carkou, hleda se v KOD i NAZEV, mezi hodnotami NEBO)
@@ -89,10 +90,6 @@ def sestav_sql(filtry):
 
     if filtry.get("pohlavi"):
         pridej("POHLAVI = ?", filtry["pohlavi"])
-
-    if filtry.get("ordinace"):
-        pridej(f"IDOSBPRA IN (SELECT ID FROM G_PRA WHERE NAZEV IN ({_zastupne(filtry['ordinace'])}))",
-               *filtry["ordinace"])
 
     # Spolecne obdobi pro vsechny filtry s datem. Konec obdobi se porovnava jako "< den po datum_do",
     # aby se zapocital cely posledni den i u sloupcu, ktere krome data obsahuji i cas.
@@ -185,15 +182,6 @@ def _spust_ve_vsech_databazich(sql, params=None, on_progress=None):
     return vysledek
 
 
-def nacti_ordinace():
-    """
-    Vrati serazeny seznam vsech odlisnych nazvu ordinaci (G_PRA.NAZEV) napric VSEMI databazemi -
-    pro vyber v rozhrani. Prochazi vsechny databaze, filtr_ui.py vysledek uklada do cache.
-    """
-    vysledek = _spust_ve_vsech_databazich("SELECT DISTINCT NAZEV FROM G_PRA WHERE NAZEV IS NOT NULL")
-    return sorted({nazev.strip() for radky in vysledek.values() for (nazev,) in radky if nazev and nazev.strip()})
-
-
 def nacti_vykony():
     """
     Vrati serazeny seznam dvojic (kod, nazev) vykonu napric VSEMI databazemi - JEDEN RADEK NA KOD.
@@ -213,14 +201,29 @@ def nacti_vykony():
     return sorted(nazev_podle_kodu.items())
 
 
-def filtruj_pacienty(filtry, on_progress=None):
+def filtruj_pacienty(filtry, on_progress=None, prirazeni_ordinaci=None):
     """
     Spusti sestaveny SQL dotaz napric vsemi databazemi ve slozce data/.
     Vraci dict {nazev_databaze: [id, ...]}.
+
+    Filtr "ordinace" (seznam klicu z ordinace.nacti_ordinace()) se neuplatnuje v SQL, ale az na
+    vysledek - podle ordinace posledniho dekurzu (viz ordinace.py), v zadanem obdobi, je-li zadane.
+    prirazeni_ordinaci: volitelny, uz spocitany vysledek ordinace.prirad_ordinace() pro STEJNE
+    obdobi (filtr_ui.py si ho pamatuje) - kdyz chybi, spocita se tady.
     """
     sql, params = sestav_sql(filtry)
     vysledek = _spust_ve_vsech_databazich(sql, params, on_progress)
-    return {nazev: [radek[0] for radek in radky] for nazev, radky in vysledek.items()}
+    vysledek = {nazev: [radek[0] for radek in radky] for nazev, radky in vysledek.items()}
+
+    if filtry.get("ordinace"):
+        if prirazeni_ordinaci is None:
+            prirazeni_ordinaci = ordinace_modul.prirad_ordinace(filtry.get("datum_od"), filtry.get("datum_do"))
+        vybrane = set(filtry["ordinace"])
+        vysledek = {
+            nazev: [i for i in ids if prirazeni_ordinaci.get(nazev, {}).get(i) in vybrane]
+            for nazev, ids in vysledek.items()
+        }
+    return vysledek
 
 
 def hledej_pokrocile_v_textu_mezi_pacienty(idosb_podle_databaze, over_text, tabulka="OBOJI",

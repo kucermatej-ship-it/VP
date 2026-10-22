@@ -14,7 +14,7 @@ mocky, `py_compile`, a uživatel ho ověří u sebe.
 1. **Stará AI aplikace** (`ui.py`, `asistent.py`, `dotaz.py`) – Ollama (`qwen3:14b`) převádí
    dotaz na SQL. Kvůli halucinacím se dál nerozvíjí.
 2. **Nová filtrovací aplikace** (hlavní vývoj): `filtr_ui.py` (Streamlit UI), `filtry.py`
-   (deterministické SQL, filtry), `text_search.py` (hledání v dekurzech/anamnézách),
+   (deterministické SQL, filtry), `text_search.py` (hledání v dekurzech/anamnézách), `ordinace.py` (zařazení pacienta do ordinace),
    `export.py` (CSV), `synonyma.py` (AI návrh synonym v bočním panelu – posílá se jen
    zadaný výraz, nikdy data pacientů).
    Sdílené: `db.py` (připojení), `schema_pravidla.py` (whitelist tabulek/sloupců – kontrola
@@ -45,6 +45,12 @@ arch -x86_64 streamlit run app/filtr_ui.py
 - **Společné období (od–do)** platí pro všechny filtry s datem i pro textové kroky.
   Výjimka – diagnóza: platí „od DATOD dále“, počítá se, když DATOD <= konec období,
   dolní hranice se neuplatní.
+- **Ordinace** (`ordinace.py`): registrace `S_OSOBA.IDOSBPRA` chybí u 80–98 % pacientů, proto
+  ordinace pacienta = ordinace jeho **posledního dekurzu** (`M_DEKURS.IDPRAZDR → G_PRAZDR.IDPRA → G_PRA`),
+  zápisy „Systém“ (G_PRA.ID 0) se ignorují, při shodě data rozhoduje vyšší `M_DEKURS.ID`.
+  S obdobím rozhoduje poslední dekurz v období; bez období je náhradou registrace.
+  Ordinace se **stejným IČP = jedna ordinace, i napříč databázemi**; bez IČP klíč databáze + ID.
+  Filtr se uplatní až po SQL (v Pythonu), přiřazení se v UI cachuje. Export: jeden sloupec „Ordinace“.
 - **Kroky 1+:** textové hledání, mezi kroky A ZÁROVEŇ, uvnitř kroku NEBO.
   Dva typy: „libovolný z výrazů“ a „klíčové slovo + číslo pod/nad hranicí“.
   Hledání nerozlišuje velká a malá písmena a hledá podřetězec. Výraz v závorkách,

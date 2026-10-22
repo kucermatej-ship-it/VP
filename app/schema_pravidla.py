@@ -47,6 +47,22 @@ SCHEMA = {
             "ICP": "identifikacni cislo pracoviste (kod ordinace pridelovany pojistovnami)",
         },
     },
+    "G_PRAZDR": {
+        "popis": "pracoviste + zdravotnik - propojka mezi zaznamem (napr. dekurzem) a ordinaci",
+        "sloupce": {
+            "ID": "jednoznacne cislo - odkazuje na nej napr. M_DEKURS.IDPRAZDR",
+            "IDPRA": "odkaz na ordinaci (G_PRA.ID)",
+        },
+    },
+    "M_DEKURS": {
+        "popis": "dekurzy (zapisy z navstev) - JEN udaje o navsteve, text dekurzu se hleda zvlast textovym hledanim",
+        "sloupce": {
+            "ID": "jednoznacne cislo dekurzu",
+            "IDOSB": "odkaz na pacienta (S_OSOBA.ID)",
+            "DATUM": "datum navstevy",
+            "IDPRAZDR": "odkaz na pracoviste a zdravotnika (G_PRAZDR.ID) - pres G_PRAZDR.IDPRA vede na ordinaci",
+        },
+    },
     "C_STATPRIS": {
         "popis": "ciselnik statnich prislusnosti - pouzij pro spojeni s S_OSOBA.STATPRIS, kdyz se otazka pta na statni prislusnost podle nazvu (napr. 'ceska')",
         "sloupce": {

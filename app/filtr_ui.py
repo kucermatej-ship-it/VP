@@ -14,6 +14,7 @@ import datetime
 import streamlit as st
 
 import filtry
+import ordinace
 import osoby
 import synonyma
 import text_search
@@ -23,7 +24,24 @@ from export import export_pacienty_filtr, export_zaznamy_po_krocich
 
 @st.cache_data(show_spinner="Nacitam seznam ordinaci ze vsech databazi...")
 def nacti_ordinace_cache():
-    return filtry.nacti_ordinace()
+    return ordinace.nacti_ordinace()
+
+
+@st.cache_data(show_spinner="Zjistuji ordinaci pacientu podle posledniho dekurzu "
+                            "(poprve to u velke databaze muze trvat i desitky sekund)...")
+def prirad_ordinace_cache(datum_od, datum_do):
+    return ordinace.prirad_ordinace(datum_od, datum_do)
+
+
+def ordinace_pro_export():
+    """{(databaze, idosb): popis ordinace} pro sloupec "Ordinace" v exportu - podle posledniho
+    dekurzu v obdobi kroku 0 (je-li zadane), jinak podle posledniho dekurzu vubec."""
+    prirazeni = prirad_ordinace_cache(None, None)
+    od, do = st.session_state.casove_omezeni_od, st.session_state.casove_omezeni_do
+    if od or do:
+        v_obdobi = prirad_ordinace_cache(od, do)
+        prirazeni = {nazev: {**pacienti, **v_obdobi.get(nazev, {})} for nazev, pacienti in prirazeni.items()}
+    return ordinace.nazvy_ordinaci_pacientu(prirazeni, nacti_ordinace_cache())
 
 
 @st.cache_data(show_spinner="Nacitam ciselnik vykonu ze vsech databazi...")
@@ -161,13 +179,17 @@ with col2:
         filtry_dict["pohlavi"] = "M" if volba == "Muz" else "F"
 
 if st.checkbox("Filtrovat podle ordinace/pracoviste"):
-    seznam_ordinaci = nacti_ordinace_cache()
-    if seznam_ordinaci:
-        ordinace = st.multiselect("Ordinace/pracoviste (lze vybrat vic)", options=seznam_ordinaci)
-        if ordinace:
-            filtry_dict["ordinace"] = ordinace
+    popisy_ordinaci = nacti_ordinace_cache()
+    if popisy_ordinaci:
+        vybrane_ordinace = st.multiselect("Ordinace/pracoviste (lze vybrat vic)",
+                                          options=list(popisy_ordinaci), format_func=popisy_ordinaci.get)
+        if vybrane_ordinace:
+            filtry_dict["ordinace"] = vybrane_ordinace
+        st.caption("Ordinace pacienta = ordinace jeho POSLEDNIHO DEKURZU (zapisy \"Systemu\" se nepocitaji). "
+                   "Pri zadanem obdobi rozhoduje posledni dekurz v obdobi. Pacient bez dekurzu se bez obdobi "
+                   "zaradi podle registrace v karte. Ordinace se stejnym ICP jsou jedna ordinace.")
     else:
-        st.info("V databazich se nenasla zadna ordinace s vyplnenym nazvem.")
+        st.info("V databazich se nenasla zadna ordinace.")
 
 casove_od, casove_do = None, None
 if st.checkbox("Omezit obdobim (plati napric vsemi filtry s datem)"):
@@ -258,7 +280,11 @@ if st.button("🔎 Filtrovat pacienty", type="primary"):
                    "Pokud to opravdu chcete, zaskrtnete alespon jeden filtr se sirokym rozsahem (napr. vek 0-130).")
     else:
         aktualizuj_progress, skryj_progress = ukazatel_postupu()
-        vysledek = filtry.filtruj_pacienty(filtry_dict, on_progress=aktualizuj_progress)
+        prirazeni = None
+        if filtry_dict.get("ordinace"):
+            prirazeni = prirad_ordinace_cache(filtry_dict.get("datum_od"), filtry_dict.get("datum_do"))
+        vysledek = filtry.filtruj_pacienty(filtry_dict, on_progress=aktualizuj_progress,
+                                           prirazeni_ordinaci=prirazeni)
         # Deduplikace podle RC se spocita JEDNOU tady - drive bezela pri kazdem prekresleni
         # stranky (kazde kliknuti na libovolny prvek) a pokazde znovu otevirala vsechny databaze.
         if sum(1 for ids in vysledek.values() if ids) > 1:
@@ -296,7 +322,7 @@ if st.session_state.vysledek_filtru is not None:
 
         if st.button("📥 Exportovat tento vysledek do CSV"):
             cesta = nova_cesta_exportu("pacienti_filtr")
-            export_pacienty_filtr(vysledek, cesta)
+            export_pacienty_filtr(vysledek, cesta, ordinace_pacientu=ordinace_pro_export())
             st.success(f"Ulozeno do: {cesta}")
 
         st.divider()
@@ -414,5 +440,5 @@ if st.session_state.vysledek_filtru is not None:
                            "v jedne bunce.")
                 if st.button("📥 Exportovat vysledek posledniho kroku do CSV (s citacemi)"):
                     cesta = nova_cesta_exportu("citace_filtr_text")
-                    export_zaznamy_po_krocich(kroky, cesta)
+                    export_zaznamy_po_krocich(kroky, cesta, ordinace_pacientu=ordinace_pro_export())
                     st.success(f"Ulozeno do: {cesta}")

@@ -6,16 +6,16 @@ Ukladejte ho jen lokalne a nesdilejte nezabezpecenym zpusobem.
 """
 import csv
 from db import nacti_podle_id, pripojeni_podle_databaze, pripravit_text
+import ordinace
 
-_PRAZDNE_UDAJE = ("", "", "", "", "", "", "")
+_PRAZDNE_UDAJE = ("", "", "", "", "", "")
 _ZAKLADNI_HLAVICKA = ["Databaze", "ID pacienta", "Prijmeni", "Jmeno", "Rodne cislo", "Datum narozeni",
                       "Telefon", "E-mail", "Ordinace"]
 
 
 def _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=None):
     """
-    Vrati dict {(databaze, idosb): (prijmeni, jmeno, rodcis, datnar, telefon, email, ordinace)} -
-    ordinace je NAZEV z G_PRA (LEFT JOIN, takze pacient bez prirazene ordinace bude mit "").
+    Vrati dict {(databaze, idosb): (prijmeni, jmeno, rodcis, datnar, telefon, email)}.
     Chybejici telefon/e-mail je "".
     spojeni: volitelny dict {nazev_databaze: jiz_otevrene_pripojeni} - viz db.pripojeni_podle_databaze().
     """
@@ -24,16 +24,23 @@ def _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=None):
     for nazev, con in pripojeni_podle_databaze(neprazdne, spojeni):
         radky = nacti_podle_id(
             con,
-            "SELECT s.ID, s.PRIJMENI, s.JMENO, s.RODCIS, s.DATNAR, s.TEL, s.MAIL, g.NAZEV "
-            "FROM S_OSOBA s LEFT JOIN G_PRA g ON s.IDOSBPRA = g.ID WHERE s.ID IN",
+            "SELECT ID, PRIJMENI, JMENO, RODCIS, DATNAR, TEL, MAIL FROM S_OSOBA WHERE ID IN",
             idosb_podle_databaze[nazev],
         )
-        for id_pacienta, prijmeni, jmeno, rodcis, datnar, telefon, email, ordinace in radky:
+        for id_pacienta, prijmeni, jmeno, rodcis, datnar, telefon, email in radky:
             udaje[(nazev, id_pacienta)] = (
                 pripravit_text(prijmeni), pripravit_text(jmeno), rodcis, datnar,
-                (telefon or "").strip(), (email or "").strip(), ordinace or "",
+                (telefon or "").strip(), (email or "").strip(),
             )
     return udaje
+
+
+def _ordinace_pacientu(ordinace_pacientu):
+    """Sloupec "Ordinace": {(databaze, idosb): popis ordinace} podle posledniho dekurzu (ordinace.py).
+    filtr_ui.py ho predava uz spocitany; kdyz chybi, spocita se tady (projde vsechny dekurzy)."""
+    if ordinace_pacientu is None:
+        ordinace_pacientu = ordinace.nazvy_ordinaci_pacientu(ordinace.prirad_ordinace(), ordinace.nacti_ordinace())
+    return ordinace_pacientu
 
 
 def export_pacienty(idosb_podle_databaze, cesta_souboru, spojeni=None):
@@ -56,22 +63,24 @@ def export_pacienty(idosb_podle_databaze, cesta_souboru, spojeni=None):
     return len(udaje)
 
 
-def export_pacienty_filtr(idosb_podle_databaze, cesta_souboru, spojeni=None):
+def export_pacienty_filtr(idosb_podle_databaze, cesta_souboru, spojeni=None, ordinace_pacientu=None):
     """
     Export ze samotneho SQL filtru (filtr_ui.py, "Krok 0") - zakladni udaje vcetne telefonu,
-    e-mailu a ordinace.
+    e-mailu a ordinace (podle posledniho dekurzu, viz _ordinace_pacientu).
     Vraci pocet pacientu.
     """
     if not idosb_podle_databaze:
         return 0
     udaje = _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=spojeni)
+    ordinace_pacientu = _ordinace_pacientu(ordinace_pacientu)
     pocet = 0
     with open(cesta_souboru, "w", newline="", encoding="utf-8-sig") as f:
         zapisovac = csv.writer(f, delimiter=";")
         zapisovac.writerow(_ZAKLADNI_HLAVICKA)
         for nazev, idosb_seznam in idosb_podle_databaze.items():
             for idosb in sorted(set(int(i) for i in idosb_seznam)):
-                zapisovac.writerow([nazev, idosb, *udaje.get((nazev, idosb), _PRAZDNE_UDAJE)])
+                zapisovac.writerow([nazev, idosb, *udaje.get((nazev, idosb), _PRAZDNE_UDAJE),
+                                    ordinace_pacientu.get((nazev, idosb), "")])
                 pocet += 1
     return pocet
 
@@ -82,7 +91,7 @@ def _format_citace(z):
     return f"[{z['zdroj']}, {z['datum']}] nalezeno: {nalezeno} — {z['ukazka']}"
 
 
-def export_zaznamy_po_krocich(kroky, cesta_souboru, spojeni=None):
+def export_zaznamy_po_krocich(kroky, cesta_souboru, spojeni=None, ordinace_pacientu=None):
     """
     Ulozi CSV z VICEKROKOVEHO textoveho hledani (kazdy dalsi krok = A ZAROVEN, viz filtr_ui.py) -
     JEDEN RADEK = JEDEN PACIENT (jen ti, co prosli VSEMI kroky, tedy jsou ve vysledku posledniho
@@ -91,6 +100,7 @@ def export_zaznamy_po_krocich(kroky, cesta_souboru, spojeni=None):
 
     kroky: seznam dict [{"popis": str, "zaznamy": [...]}, ...] v poradi Krok 1, Krok 2, ... -
     odpovida st.session_state.kroky_hledani z filtr_ui.py.
+    ordinace_pacientu: viz _ordinace_pacientu.
     """
     if not kroky or not kroky[-1]["zaznamy"]:
         return 0
@@ -100,6 +110,7 @@ def export_zaznamy_po_krocich(kroky, cesta_souboru, spojeni=None):
     for databaze, idosb in finalni_pacienti:
         idosb_podle_databaze.setdefault(databaze, set()).add(idosb)
     udaje = _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=spojeni)
+    ordinace_pacientu = _ordinace_pacientu(ordinace_pacientu)
 
     # Pro kazdy krok zvlast: {(databaze, idosb): [citace z TOHOTO kroku]}.
     citace_podle_kroku = []
@@ -116,7 +127,7 @@ def export_zaznamy_po_krocich(kroky, cesta_souboru, spojeni=None):
         ])
         for klic in finalni_pacienti:
             zapisovac.writerow([
-                *klic, *udaje.get(klic, _PRAZDNE_UDAJE),
+                *klic, *udaje.get(klic, _PRAZDNE_UDAJE), ordinace_pacientu.get(klic, ""),
                 *("\n".join(mapa.get(klic, [])) for mapa in citace_podle_kroku),
             ])
 
