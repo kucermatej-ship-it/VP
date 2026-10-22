@@ -6,138 +6,148 @@ vybranych pacientu, pokud je predem znamy filtr z SQL) a vrati se VSECHNY shody,
 jen prvnich N. U velmi velkych tabulek (statisice a vice zaznamu) proto muze textove
 hledani trvat déle - to je vedomy kompromis: presnost odpovedi ma prednost pred rychlosti.
 
-Krome jednoduche funkce "obsahuje tento podretezec" (hledej_v_dekurzech_jedna / _anamnezach_jedna,
-pouziva je asistent.py pro AI-rizene dotazy) jsou tu i "pokrocile" varianty (hledej_..._pokrocile),
-ktere misto pevneho vyrazu berou libovolnou funkci over_text() - viz shoda_kterykoliv_vyraz a
-shoda_cislo_u_klicoveho_slova nize. Pouziva je filtry.py pro rucne skladane, vicekrokove hledani
-(napr. "NYHA II NEBO NYHA III" v jednom kroku, "NT-proBNP pod hranici 300" v druhem).
+Jadrem je hledej_v_tabulce(), ktera misto pevneho vyrazu bere funkci over_text(text) -> shoda
+nebo None (viz shoda_kterykoliv_vyraz a shoda_cislo_u_klicoveho_slova nize). Funkce
+hledej_v_*_jedna (pevny vyraz, pouziva stara aplikace asistent.py) a hledej_v_*_pokrocile
+(pouziva filtry.py) jsou jen tenke obaly kolem ni.
 """
+import datetime
 import re
 
 from firebird.driver import DatabaseError
 
 from db import pripravit_text, rozdel_na_davky
 
+# zdroj -> (tabulka, sloupec s datem, sloupec s textem, razeni)
+_TABULKY = {
+    "dekurz": ("M_DEKURS", "DATUM", "DEKURS", " ORDER BY DATUM DESC"),
+    "anamneza": ("M_ANAMNESA", "DATCAS", "TXTANAM", ""),
+}
+
 
 def precti_blob(hodnota):
     """Prevede hodnotu z databaze (muze byt str, bytes, nebo 'lazy' BlobReader) na cisty retezec."""
-    if hodnota is None:
-        return None
-    if isinstance(hodnota, str):
+    if hodnota is None or isinstance(hodnota, str):
         return hodnota
-    if isinstance(hodnota, bytes):
-        return hodnota.decode("cp1250", errors="replace")
-    obsah = hodnota.read()
-    if isinstance(obsah, bytes):
-        return obsah.decode("cp1250", errors="replace")
-    return obsah
+    if not isinstance(hodnota, bytes):
+        hodnota = hodnota.read()
+        if isinstance(hodnota, str):
+            return hodnota
+    return hodnota.decode("cp1250", errors="replace")
 
 
-def _nacti_pripravene_radky(cur, sestav_sql, sestav_pocet_sql, davky, on_progress):
+def _nacti_pripravene_radky(cur, dotazy, on_progress):
     """
-    Spolecne jadro pro _hledej a _hledej_s_vyhodnocenim - postupne provede vsechny davky a
-    pro kazdy nalezeny zaznam vraci (idosb, datum, pripraveny_text). Prubezne hlasi postup
-    pres on_progress(zpracovano, celkem), pokud je zadany (viz _hledej nize pro vysvetleni,
-    proc se kvuli tomu nejdriv spocita SELECT COUNT(*)).
+    Postupne provede vsechny dotazy (seznam trojic (sql, sql_pocet, params), jedna na davku
+    pacientu) a pro kazdy nacteny zaznam vraci (idosb, datum, pripraveny_text). Prubezne hlasi
+    postup pres on_progress(zpracovano, celkem), pokud je zadany - kvuli tomu se nejdriv
+    spocita SELECT COUNT(*), coz je levne (necte se pri nem obsah textovych poli).
 
-    ODOLNOST VUCI ZIVE DATABAZI: jde o hledani BEZ LIMITU, ktere muze u velkych tabulek bezet
-    i nekolik minut - mezitim muze personal ordinace zaznam bezne prepsat/smazat. Pak uz jeho
-    puvodni BLOB neexistuje a ovladac pri jeho cteni vyhodi DatabaseError ("BLOB not found").
-    Takovy jeden zaznam proto jen PRESKOCIME (nepocita se jako shoda) a pokracujeme dal -
-    nejde o chybu v datech ani v kodu, jen o soubeh s bezicim provozem, a rozhodne by kvuli
-    nemu nemelo prijit vniveč cele (casto mnohaminutove) hledani.
+    ODOLNOST VUCI ZIVE DATABAZI: hledani BEZ LIMITU muze u velkych tabulek bezet i nekolik
+    minut - mezitim muze personal ordinace zaznam bezne prepsat/smazat. Pak uz jeho puvodni
+    BLOB neexistuje a ovladac pri jeho cteni vyhodi DatabaseError ("BLOB not found").
+    Takovy zaznam jen PRESKOCIME (nepocita se jako shoda) a pokracujeme dal.
     """
-    davky = list(davky)
-    celkem_zaznamu = None
+    celkem = None
     if on_progress:
-        celkem_zaznamu = 0
-        for davka in davky:
-            cur.execute(sestav_pocet_sql(davka))
-            celkem_zaznamu += cur.fetchone()[0]
+        celkem = 0
+        for _, sql_pocet, params in dotazy:
+            cur.execute(sql_pocet, params)
+            celkem += cur.fetchone()[0]
 
     zpracovano = 0
     preskozeno = 0
-    posledni_ohlasene_procento = -1
+    posledni_procento = -1
 
-    def ohlas_pokrok():
-        nonlocal posledni_ohlasene_procento
-        if on_progress and celkem_zaznamu:
-            aktualni_procento = int(100 * zpracovano / celkem_zaznamu)
-            if aktualni_procento != posledni_ohlasene_procento:
-                posledni_ohlasene_procento = aktualni_procento
-                on_progress(zpracovano, celkem_zaznamu)
-
-    for davka in davky:
-        cur.execute(sestav_sql(davka))
+    for sql, _, params in dotazy:
+        cur.execute(sql, params)
         while True:
             try:
                 radek = cur.fetchone()
+                if radek is None:
+                    break
+                idosb, datum, blob = radek
+                # Velky BLOB se cte az tady (ne pri fetchone) - i tady muze prijit "BLOB not found".
+                text = precti_blob(blob)
             except DatabaseError:
-                zpracovano += 1
+                text = None
                 preskozeno += 1
-                ohlas_pokrok()
-                continue
-            if radek is None:
-                break
-            idosb, datum, blob_text = radek
+            else:
+                text = pripravit_text(text)
             zpracovano += 1
-            ohlas_pokrok()
-            text = pripravit_text(precti_blob(blob_text))
+            if celkem:
+                procento = 100 * zpracovano // celkem
+                if procento != posledni_procento:
+                    posledni_procento = procento
+                    on_progress(zpracovano, celkem)
             if text:
                 yield idosb, datum, text
 
-    if on_progress and celkem_zaznamu:
-        on_progress(celkem_zaznamu, celkem_zaznamu)
+    if celkem:
+        on_progress(celkem, celkem)
     if preskozeno:
         print(f"[text_search] Preskoceno {preskozeno} z {zpracovano} zaznamu behem hledani "
               f"(zaznam byl mezitim v zive databazi zmenen/smazan - BLOB not found).")
 
 
-def _hledej(con, sestav_sql, sestav_pocet_sql, vyraz, idosb_seznam, on_progress=None):
+def _sestav_dotazy(zdroj, idosb_seznam, datum_od, datum_do):
     """
-    Hleda na JIZ OTEVRENEM pripojeni (con) - pripojeni si otevira a zavira volajici (asistent.py),
-    aby se pro jednu otazku k jedne databazi nepripojovalo opakovane.
+    Pripravi seznam (sql, sql_pocet, params) - jeden dotaz na kazdou davku pacientu (nebo jeden
+    pro celou tabulku, kdyz idosb_seznam je None). ID pacientu se vkladaji primo do SQL az po
+    prevodu na int, data obdobi jako parametry "?".
 
-    on_progress: volitelna funkce on_progress(zpracovano, celkem), kterou zavolame prubezne behem
-    prochazeni (pri kazde zmene celeho procenta) - aby volajici (UI) mohl ukazat postup. Kvuli tomu
-    se pred samotnym ctenim textu nejdriv rychle spocita celkovy pocet zaznamu (SELECT COUNT(*)) -
-    to je levna operace (necte se pri ni obsah textovych poli), takze navic vykonu je zanedbatelne
-    ve srovnani se samotnym cistenim a prohledavanim textu.
+    Konec obdobi se porovnava jako "< den po datum_do" - sloupec s datem muze obsahovat i cas
+    (napr. M_ANAMNESA.DATCAS), a "<= datum_do" by pak vynechal zaznamy z posledniho dne obdobi
+    zapsane po pulnoci.
     """
-    cur = con.cursor()
+    tabulka, sloupec_data, sloupec_textu, razeni = _TABULKY[zdroj]
+    podminky = f"{sloupec_textu} IS NOT NULL"
+    params = []
+    if datum_od is not None:
+        podminky += f" AND {sloupec_data} >= ?"
+        params.append(datum_od.isoformat())
+    if datum_do is not None:
+        podminky += f" AND {sloupec_data} < ?"
+        params.append((datum_do + datetime.timedelta(days=1)).isoformat())
+
+    davky = [None] if idosb_seznam is None else rozdel_na_davky(sorted(set(int(i) for i in idosb_seznam)))
+    dotazy = []
+    for davka in davky:
+        podminky_davky = podminky
+        if davka is not None:
+            podminky_davky = f"IDOSB IN ({','.join(str(i) for i in davka)}) AND {podminky}"
+        dotazy.append((
+            f"SELECT IDOSB, {sloupec_data}, CAST({sloupec_textu} AS BLOB SUB_TYPE 0) "
+            f"FROM {tabulka} WHERE {podminky_davky}{razeni}",
+            f"SELECT COUNT(*) FROM {tabulka} WHERE {podminky_davky}",
+            params,
+        ))
+    return dotazy
+
+
+def hledej_v_tabulce(con, zdroj, over_text, idosb_seznam=None, on_progress=None, datum_od=None, datum_do=None):
+    """
+    Prohleda texty v tabulce dane zdrojem ("dekurz" = M_DEKURS.DEKURS, "anamneza" =
+    M_ANAMNESA.TXTANAM) na JIZ OTEVRENEM pripojeni con - pripojeni otevira a zavira volajici.
+
+    over_text: funkce over_text(text) -> shoda (dict) nebo None - viz shoda_kterykoliv_vyraz /
+    shoda_cislo_u_klicoveho_slova nize.
+    idosb_seznam: None = cela tabulka, jinak jen zaznamy techto pacientu (prazdny seznam = nic).
+    datum_od, datum_do: volitelne datetime.date - jen zaznamy s datem v tomto rozmezi.
+    on_progress: volitelna funkce on_progress(zpracovano, celkem) pro ukazatel postupu.
+
+    Vraci seznam [{"idosb", "datum", "ukazka", ...dalsi klice ze shody}, ...].
+    """
+    dotazy = _sestav_dotazy(zdroj, idosb_seznam, datum_od, datum_do)
     vysledky = []
-    vyraz_lower = vyraz.lower()
-
-    davky = rozdel_na_davky(idosb_seznam, 1000) if idosb_seznam else [None]
-
-    for idosb, datum, text in _nacti_pripravene_radky(cur, sestav_sql, sestav_pocet_sql, davky, on_progress):
-        if vyraz_lower in text.lower():
-            pozice = text.lower().find(vyraz_lower)
-            zacatek = max(0, pozice - 60)
-            konec = min(len(text), pozice + len(vyraz) + 60)
-            ukazka = text[zacatek:konec]
-            vysledky.append({"idosb": idosb, "datum": datum, "ukazka": ukazka})
+    for idosb, datum, text in _nacti_pripravene_radky(con.cursor(), dotazy, on_progress):
+        shoda = over_text(text)
+        if shoda:
+            vysledky.append({"idosb": idosb, "datum": datum, **shoda})
     return vysledky
 
 
-def hledej_v_dekurzech_jedna(con, vyraz, idosb_seznam=None, on_progress=None):
-    """Prohleda VSECHNY zaznamy v M_DEKURS.DEKURS v JEDNE konkretni databazi (na jiz otevrenem pripojeni con)."""
-    def sestav_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT IDOSB, DATUM, CAST(DEKURS AS BLOB SUB_TYPE 0) FROM M_DEKURS WHERE IDOSB IN ({idcka}) AND DEKURS IS NOT NULL ORDER BY DATUM DESC"
-        return "SELECT IDOSB, DATUM, CAST(DEKURS AS BLOB SUB_TYPE 0) FROM M_DEKURS WHERE DEKURS IS NOT NULL ORDER BY DATUM DESC"
-
-    def sestav_pocet_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT COUNT(*) FROM M_DEKURS WHERE IDOSB IN ({idcka}) AND DEKURS IS NOT NULL"
-        return "SELECT COUNT(*) FROM M_DEKURS WHERE DEKURS IS NOT NULL"
-
-    return _hledej(con, sestav_sql, sestav_pocet_sql, vyraz, idosb_seznam, on_progress=on_progress)
-
-
-# --- Pokrocile hledani (funkce over_text misto pevneho vyrazu) -------------------------------
+# --- Funkce over_text pro ruzne typy hledani ------------------------------------------------
 
 def _sestav_vzor_hledani(vyraz):
     """
@@ -146,7 +156,7 @@ def _sestav_vzor_hledani(vyraz):
 
     Je-li vyraz obaleny v kulatych zavorkach, napr. "(EF)", hleda se jako CELE SAMOSTATNE SLOVO
     (hranice slova pred i za nim) - "EF" tak NENAJDE "efekt" ani "telefonat". Bez zavorek se
-    hleda jako PODRETEZEC (puvodni chovani) - "EF" tak najde i "efekt".
+    hleda jako PODRETEZEC - "EF" tak najde i "efekt".
     """
     vyraz = vyraz.strip()
     if vyraz.startswith("(") and vyraz.endswith(")") and len(vyraz) > 2:
@@ -159,11 +169,8 @@ def _sestav_vzor_hledani(vyraz):
 def shoda_kterykoliv_vyraz(vyrazy):
     """
     Vraci funkci over_text(text) -> shoda (dict) nebo None, ktera oznaci shodu, pokud text
-    obsahuje ALESPON JEDEN z dane seznamu vyrazu (logicke NEBO), bez ohledu na velikost pismen.
-    Priklad pouziti: shoda_kterykoliv_vyraz(["NYHA II", "NYHA III"]).
-
-    Vyraz obaleny v zavorkach, napr. "(EF)", se hleda jako cele samostatne slovo - viz
-    _sestav_vzor_hledani vyse.
+    obsahuje ALESPON JEDEN z danych vyrazu (logicke NEBO), bez ohledu na velikost pismen.
+    Priklad: shoda_kterykoliv_vyraz(["NYHA II", "NYHA III"]).
     """
     vzory = [_sestav_vzor_hledani(vyraz) for vyraz in vyrazy]
 
@@ -172,8 +179,7 @@ def shoda_kterykoliv_vyraz(vyrazy):
             shoda = vzor.search(text)
             if shoda:
                 zacatek = max(0, shoda.start() - 60)
-                konec = min(len(text), shoda.end() + 60)
-                return {"ukazka": text[zacatek:konec], "nalezeny_vyraz": zobrazovany_vyraz}
+                return {"ukazka": text[zacatek:shoda.end() + 60], "nalezeny_vyraz": zobrazovany_vyraz}
         return None
     return over_text
 
@@ -194,17 +200,12 @@ _VZOR_CISLA_ZA_SLOVEM = re.compile(r"\D{0,20}?(-?\d+[.,]?\d*)")
 def shoda_cislo_u_klicoveho_slova(klicove_slovo, operator, hranice):
     """
     Vraci funkci over_text(text) -> shoda (dict) nebo None, ktera hleda VSECHNY vyskyty
-    klicoveho slova (napr. "NT-proBNP") v textu a u kazdeho zkusi najit cislo nedaleko za nim
-    (viz _VZOR_CISLA_ZA_SLOVEM) - pokud cislo najde, porovna ho s hranici pres operator
-    ("<", "<=", ">", ">=", "="). Vraci i to nalezene cislo (pole "nalezene_cislo"), aby sel
-    vysledek rucne zkontrolovat.
+    klicoveho slova (napr. "NT-proBNP") a u kazdeho zkusi najit cislo nedaleko za nim - pokud
+    ho najde, porovna ho s hranici pres operator ("<", "<=", ">", ">=", "="). Vraci i nalezene
+    cislo (pole "nalezene_cislo"), aby sel vysledek rucne zkontrolovat.
 
-    POZOR: jde o odhad z VOLNEHO textu, ne o presna strukturovana data - u neobvykleho zapisu
-    (jina jednotka pred cislem, format desetinne carky, prekleply nazev) muze shoda chybet.
-    Doporucujeme u dulezitych vysledku zkontrolovat nekolik ukazek rucne.
-
-    Klicove slovo obalene v zavorkach, napr. "(EF)", se hleda jako cele samostatne slovo - viz
-    _sestav_vzor_hledani vyse (jinak by "EF" naslo i cislo za slovem "efekt" apod.).
+    POZOR: jde o odhad z VOLNEHO textu - u neobvykleho zapisu muze shoda chybet.
+    Klicove slovo v zavorkach, napr. "(EF)", se hleda jako cele samostatne slovo.
     """
     if operator not in _OPERATORY_CISLA:
         raise ValueError(f"Neznamy operator: {operator} (povolene: {sorted(_OPERATORY_CISLA)})")
@@ -214,108 +215,35 @@ def shoda_cislo_u_klicoveho_slova(klicove_slovo, operator, hranice):
     def over_text(text):
         for shoda_slova in vzor_slova.finditer(text):
             konec_slova = shoda_slova.end()
-            shoda_cisla = _VZOR_CISLA_ZA_SLOVEM.match(text[konec_slova:konec_slova + 30])
-            if shoda_cisla:
-                try:
-                    cislo = float(shoda_cisla.group(1).replace(",", "."))
-                except ValueError:
-                    cislo = None
-                if cislo is not None and porovnej(cislo, hranice):
-                    zacatek = max(0, shoda_slova.start() - 40)
-                    konec = min(len(text), konec_slova + 40)
-                    return {"ukazka": text[zacatek:konec], "nalezene_cislo": cislo}
+            shoda_cisla = _VZOR_CISLA_ZA_SLOVEM.match(text, konec_slova, konec_slova + 30)
+            if not shoda_cisla:
+                continue
+            try:
+                cislo = float(shoda_cisla.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            if porovnej(cislo, hranice):
+                zacatek = max(0, shoda_slova.start() - 40)
+                return {"ukazka": text[zacatek:konec_slova + 40], "nalezene_cislo": cislo}
         return None
     return over_text
 
 
-def _hledej_s_vyhodnocenim(con, sestav_sql, sestav_pocet_sql, over_text, idosb_seznam, on_progress=None):
-    """Stejne jako _hledej, ale misto pevneho podretezce pouziva funkci over_text(text) ->
-    shoda (dict) nebo None - viz shoda_kterykoliv_vyraz / shoda_cislo_u_klicoveho_slova vyse."""
-    cur = con.cursor()
-    vysledky = []
-    davky = rozdel_na_davky(idosb_seznam, 1000) if idosb_seznam else [None]
-
-    for idosb, datum, text in _nacti_pripravene_radky(cur, sestav_sql, sestav_pocet_sql, davky, on_progress):
-        shoda = over_text(text)
-        if shoda:
-            vysledky.append({"idosb": idosb, "datum": datum, **shoda})
-    return vysledky
-
-
-def _datova_podminka(sloupec, datum_od, datum_do):
-    """
-    Sestavi SQL fragment " AND sloupec >= 'YYYY-MM-DD' AND sloupec <= 'YYYY-MM-DD'" pro volitelne
-    omezeni datem (nebo "" kdyz ani jedno neni zadano). datum_od/datum_do MUSI byt datetime.date
-    (nebo None) - .isoformat() vzdy vyrobi jen cislice a pomlcky, takze je to bezpecne vlozit
-    primo do SQL textu (stejny pristup jako u IDOSB IN (...) vyse, kde se cisla taky vkladaji
-    primo po overeni pres int()).
-    """
-    fragment = ""
-    if datum_od is not None:
-        fragment += f" AND {sloupec} >= '{datum_od.isoformat()}'"
-    if datum_do is not None:
-        fragment += f" AND {sloupec} <= '{datum_do.isoformat()}'"
-    return fragment
-
+# --- Obaly pro volajici ---------------------------------------------------------------------
 
 def hledej_v_dekurzech_pokrocile(con, over_text, idosb_seznam=None, on_progress=None, datum_od=None, datum_do=None):
-    """
-    Prohleda VSECHNY zaznamy v M_DEKURS.DEKURS pomoci funkce over_text (viz vyse).
-    datum_od, datum_do: volitelne datetime.date - omezi hledani jen na zaznamy s DATUM v tomto rozmezi.
-    """
-    datova_podminka = _datova_podminka("DATUM", datum_od, datum_do)
-
-    def sestav_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return (f"SELECT IDOSB, DATUM, CAST(DEKURS AS BLOB SUB_TYPE 0) FROM M_DEKURS WHERE IDOSB IN ({idcka}) "
-                    f"AND DEKURS IS NOT NULL{datova_podminka} ORDER BY DATUM DESC")
-        return f"SELECT IDOSB, DATUM, CAST(DEKURS AS BLOB SUB_TYPE 0) FROM M_DEKURS WHERE DEKURS IS NOT NULL{datova_podminka} ORDER BY DATUM DESC"
-
-    def sestav_pocet_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT COUNT(*) FROM M_DEKURS WHERE IDOSB IN ({idcka}) AND DEKURS IS NOT NULL{datova_podminka}"
-        return f"SELECT COUNT(*) FROM M_DEKURS WHERE DEKURS IS NOT NULL{datova_podminka}"
-
-    return _hledej_s_vyhodnocenim(con, sestav_sql, sestav_pocet_sql, over_text, idosb_seznam, on_progress=on_progress)
+    return hledej_v_tabulce(con, "dekurz", over_text, idosb_seznam, on_progress, datum_od, datum_do)
 
 
 def hledej_v_anamnezach_pokrocile(con, over_text, idosb_seznam=None, on_progress=None, datum_od=None, datum_do=None):
-    """
-    Prohleda VSECHNY zaznamy v M_ANAMNESA.TXTANAM pomoci funkce over_text (viz vyse).
-    datum_od, datum_do: volitelne datetime.date - omezi hledani jen na zaznamy s DATCAS v tomto rozmezi.
-    """
-    datova_podminka = _datova_podminka("DATCAS", datum_od, datum_do)
+    return hledej_v_tabulce(con, "anamneza", over_text, idosb_seznam, on_progress, datum_od, datum_do)
 
-    def sestav_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return (f"SELECT IDOSB, DATCAS, CAST(TXTANAM AS BLOB SUB_TYPE 0) FROM M_ANAMNESA WHERE IDOSB IN ({idcka}) "
-                    f"AND TXTANAM IS NOT NULL{datova_podminka}")
-        return f"SELECT IDOSB, DATCAS, CAST(TXTANAM AS BLOB SUB_TYPE 0) FROM M_ANAMNESA WHERE TXTANAM IS NOT NULL{datova_podminka}"
 
-    def sestav_pocet_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT COUNT(*) FROM M_ANAMNESA WHERE IDOSB IN ({idcka}) AND TXTANAM IS NOT NULL{datova_podminka}"
-        return f"SELECT COUNT(*) FROM M_ANAMNESA WHERE TXTANAM IS NOT NULL{datova_podminka}"
-
-    return _hledej_s_vyhodnocenim(con, sestav_sql, sestav_pocet_sql, over_text, idosb_seznam, on_progress=on_progress)
+def hledej_v_dekurzech_jedna(con, vyraz, idosb_seznam=None, on_progress=None):
+    """Hledani jednoho vyrazu (podretezec, bez ohledu na velikost pismen) - pro asistent.py."""
+    return hledej_v_tabulce(con, "dekurz", shoda_kterykoliv_vyraz([vyraz]), idosb_seznam, on_progress)
 
 
 def hledej_v_anamnezach_jedna(con, vyraz, idosb_seznam=None, on_progress=None):
-    """Prohleda VSECHNY zaznamy v M_ANAMNESA.TXTANAM v JEDNE konkretni databazi (na jiz otevrenem pripojeni con)."""
-    def sestav_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT IDOSB, DATCAS, CAST(TXTANAM AS BLOB SUB_TYPE 0) FROM M_ANAMNESA WHERE IDOSB IN ({idcka}) AND TXTANAM IS NOT NULL"
-        return "SELECT IDOSB, DATCAS, CAST(TXTANAM AS BLOB SUB_TYPE 0) FROM M_ANAMNESA WHERE TXTANAM IS NOT NULL"
-
-    def sestav_pocet_sql(davka):
-        if davka:
-            idcka = ",".join(str(int(i)) for i in davka)
-            return f"SELECT COUNT(*) FROM M_ANAMNESA WHERE IDOSB IN ({idcka}) AND TXTANAM IS NOT NULL"
-        return "SELECT COUNT(*) FROM M_ANAMNESA WHERE TXTANAM IS NOT NULL"
-
-    return _hledej(con, sestav_sql, sestav_pocet_sql, vyraz, idosb_seznam, on_progress=on_progress)
+    """Hledani jednoho vyrazu (podretezec, bez ohledu na velikost pismen) - pro asistent.py."""
+    return hledej_v_tabulce(con, "anamneza", shoda_kterykoliv_vyraz([vyraz]), idosb_seznam, on_progress)

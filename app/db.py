@@ -12,6 +12,7 @@ Zjisteni:
   neporovnavejte cisla ID mezi ruznymi databazemi, jsou to nahodne shody.
   Jedine spolehlive univerzalni spojeni mezi databazemi je RODCIS.
 """
+import html
 import os
 import re
 from firebird.driver import driver_config, connect
@@ -32,6 +33,7 @@ EXPORT_SLOZKA = os.path.join(_PROJEKT_SLOZKA, "export")
 
 _DIAK = "áéěíóúůýčďňřšťžÁÉĚÍÓÚŮÝČĎŇŘŠŤŽ"
 _PATTERN = re.compile(r"(?<=\S) (?=[" + _DIAK + "])")
+_DIAK_ZNAK = re.compile("[" + _DIAK + "]")
 
 # Chyba v datech vklada mezeru pred KAZDY znak s diakritikou (i uprostred slova, napr.
 # "léčba" -> "l é čba"). V cistem textu se tento vzor (mezera hned pred znakem s diakritikou)
@@ -52,7 +54,9 @@ def oprav_text(text):
     """Opravi chybne vlozene mezery pred diakritikou, pokud je text poskozeny."""
     if text is None or not isinstance(text, str) or len(text) == 0:
         return text
-    pocet_diakritickych_znaku = sum(1 for znak in text if znak in _DIAK)
+    # Pocitani pres regex je vyrazne rychlejsi nez prochazet text znak po znaku v Pythonu -
+    # tato funkce bezi pro kazdy prohledavany dekurz/anamnezu.
+    pocet_diakritickych_znaku = len(_DIAK_ZNAK.findall(text))
     if pocet_diakritickych_znaku < _MIN_DIAKRITICKYCH_ZNAKU:
         return text
     matches = _PATTERN.findall(text)
@@ -70,9 +74,8 @@ def ocisti_html(text):
     """Odstrani HTML znacky a sjednoti bile znaky. Pouziva se po oprav_text()."""
     if text is None or not isinstance(text, str) or len(text) == 0:
         return text
-    import html as _html
     bez_znacek = _HTML_TAG.sub(" ", text)
-    rozbaleno = _html.unescape(bez_znacek)
+    rozbaleno = html.unescape(bez_znacek)
     ocistene = _WHITESPACE.sub(" ", rozbaleno)
     return ocistene.strip()
 
@@ -109,3 +112,42 @@ def rozdel_na_davky(seznam, velikost=1000):
     seznam = list(seznam)
     for i in range(0, len(seznam), velikost):
         yield seznam[i:i + velikost]
+
+
+def pripojeni_podle_databaze(nazvy, spojeni=None):
+    """
+    Postupne vraci dvojice (nazev_databaze, pripojeni) pro zadane nazvy databazi.
+
+    spojeni: volitelny dict {nazev_databaze: jiz_otevrene_pripojeni} - kdyz je predany
+    (typicky z asistent.py), pouzije se rovnou a NEZAVIRA se (o to se stara volajici).
+    Kdyz neni predany, pripojeni se otevre a po zpracovani dane databaze hned zase zavre.
+    Databaze, ktera neni k dispozici (neni ve spojeni / ve slozce data/), se preskoci.
+    """
+    if spojeni is not None:
+        for nazev in nazvy:
+            if nazev in spojeni:
+                yield nazev, spojeni[nazev]
+        return
+    cesty = {o["nazev"]: o["cesta"] for o in seznam_databazi()}
+    for nazev in nazvy:
+        if nazev not in cesty:
+            continue
+        con = get_connection(cesty[nazev])
+        try:
+            yield nazev, con
+        finally:
+            con.close()
+
+
+def nacti_podle_id(con, sql_pred_seznamem, idcka):
+    """
+    Spusti "sql_pred_seznamem (id1,id2,...)" po davkach (viz rozdel_na_davky) a vrati vsechny
+    radky. ID se pred vlozenim do SQL prevedou na int - do textu dotazu se tak nikdy nedostane
+    nic jineho nez cisla. Priklad: nacti_podle_id(con, "SELECT ID, RODCIS FROM S_OSOBA WHERE ID IN", ids)
+    """
+    cur = con.cursor()
+    radky = []
+    for davka in rozdel_na_davky(sorted(set(int(i) for i in idcka))):
+        cur.execute(f"{sql_pred_seznamem} ({','.join(str(i) for i in davka)})")
+        radky.extend(cur.fetchall())
+    return radky

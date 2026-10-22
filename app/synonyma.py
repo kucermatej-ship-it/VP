@@ -40,8 +40,12 @@ def navrhni_synonyma(vyraz):
         return []
 
     try:
+        # think=False: u jednoducheho seznamu variant neni "premysleni" modelu potreba a odpoved
+        # je pak vyrazne rychlejsi. keep_alive drzi model v pameti pro dalsi dotaz (jako asistent.py).
         odpoved = ollama.chat(
             model=MODEL,
+            think=False,
+            keep_alive="30m",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": vyraz},
@@ -53,7 +57,7 @@ def navrhni_synonyma(vyraz):
             f"Nepodarilo se ziskat navrhy od AI (bezi Ollama? je stazeny model {MODEL}?): {e}"
         ) from e
 
-    # Qwen obcas prida pred skutecnou odpovedi blok <think>...</think> s uvahou - ten zahodime.
+    # Pojistka: kdyby model presto vratil blok <think>...</think> s uvahou, zahodime ho.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
     puvodni_lower = vyraz.casefold()
