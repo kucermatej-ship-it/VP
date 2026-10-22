@@ -7,14 +7,16 @@ Ukladejte ho jen lokalne a nesdilejte nezabezpecenym zpusobem.
 import csv
 from db import nacti_podle_id, pripojeni_podle_databaze, pripravit_text
 
-_PRAZDNE_UDAJE = ("", "", "", "", "")
-_ZAKLADNI_HLAVICKA = ["Databaze", "ID pacienta", "Prijmeni", "Jmeno", "Rodne cislo", "Datum narozeni", "Ordinace"]
+_PRAZDNE_UDAJE = ("", "", "", "", "", "", "")
+_ZAKLADNI_HLAVICKA = ["Databaze", "ID pacienta", "Prijmeni", "Jmeno", "Rodne cislo", "Datum narozeni",
+                      "Telefon", "E-mail", "Ordinace"]
 
 
 def _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=None):
     """
-    Vrati dict {(databaze, idosb): (prijmeni, jmeno, rodcis, datnar, ordinace)} - ordinace je
-    NAZEV z G_PRA (LEFT JOIN, takze pacient bez prirazene ordinace bude mit "").
+    Vrati dict {(databaze, idosb): (prijmeni, jmeno, rodcis, datnar, telefon, email, ordinace)} -
+    ordinace je NAZEV z G_PRA (LEFT JOIN, takze pacient bez prirazene ordinace bude mit "").
+    Chybejici telefon/e-mail je "".
     spojeni: volitelny dict {nazev_databaze: jiz_otevrene_pripojeni} - viz db.pripojeni_podle_databaze().
     """
     neprazdne = [n for n, ids in idosb_podle_databaze.items() if ids]
@@ -22,13 +24,14 @@ def _nacti_udaje_pacientu(idosb_podle_databaze, spojeni=None):
     for nazev, con in pripojeni_podle_databaze(neprazdne, spojeni):
         radky = nacti_podle_id(
             con,
-            "SELECT s.ID, s.PRIJMENI, s.JMENO, s.RODCIS, s.DATNAR, g.NAZEV "
+            "SELECT s.ID, s.PRIJMENI, s.JMENO, s.RODCIS, s.DATNAR, s.TEL, s.MAIL, g.NAZEV "
             "FROM S_OSOBA s LEFT JOIN G_PRA g ON s.IDOSBPRA = g.ID WHERE s.ID IN",
             idosb_podle_databaze[nazev],
         )
-        for id_pacienta, prijmeni, jmeno, rodcis, datnar, ordinace in radky:
+        for id_pacienta, prijmeni, jmeno, rodcis, datnar, telefon, email, ordinace in radky:
             udaje[(nazev, id_pacienta)] = (
-                pripravit_text(prijmeni), pripravit_text(jmeno), rodcis, datnar, ordinace or ""
+                pripravit_text(prijmeni), pripravit_text(jmeno), rodcis, datnar,
+                (telefon or "").strip(), (email or "").strip(), ordinace or "",
             )
     return udaje
 
@@ -48,14 +51,15 @@ def export_pacienty(idosb_podle_databaze, cesta_souboru, spojeni=None):
         # Poradi databazi zachovame, uvnitr databaze radime podle prijmeni.
         for nazev in idosb_podle_databaze:
             radky = [(idosb, u) for (n, idosb), u in udaje.items() if n == nazev]
-            for idosb, (prijmeni, jmeno, rodcis, datnar, _) in sorted(radky, key=lambda r: r[1][0] or ""):
+            for idosb, (prijmeni, jmeno, rodcis, datnar, *_) in sorted(radky, key=lambda r: r[1][0] or ""):
                 zapisovac.writerow([idosb, prijmeni, jmeno, rodcis, datnar])
     return len(udaje)
 
 
 def export_pacienty_filtr(idosb_podle_databaze, cesta_souboru, spojeni=None):
     """
-    Export ze samotneho SQL filtru (filtr_ui.py, "Krok 0") - zakladni udaje vcetne ordinace.
+    Export ze samotneho SQL filtru (filtr_ui.py, "Krok 0") - zakladni udaje vcetne telefonu,
+    e-mailu a ordinace.
     Vraci pocet pacientu.
     """
     if not idosb_podle_databaze:
